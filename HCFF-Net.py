@@ -274,14 +274,14 @@ saved_model_path = 'D:\\TrainedModels\\CustomModel2\\Train_Val_CustomModel_07_Se
 model.load_state_dict(torch.load(saved_model_path),strict=False)
 model.head = nn.Linear(768, 10)
 model.to(device)
-print("✅ ConvNeXt backbone loaded, head initialized for 10 classes")
+print(" ConvNeXt backbone loaded, head initialized for 10 classes")
 print(model)
 
 densenet = models.densenet121(pretrained=True)
 densenet.classifier = nn.Linear(densenet.classifier.in_features, 10)
 densenet_ckpt = torch.load("D:\\TrainedModels\\DenseNet121\\Train_Val_result_14_Apr_ACID_denseNet-121_.pt", map_location="cuda")
 densenet.load_state_dict(densenet_ckpt, strict=False)
-print("✅ Loaded your trained DenseNet121 weights.")
+print(" Loaded your trained DenseNet121 weights.")
 
 
 class SpatialConcatFusion(nn.Module):
