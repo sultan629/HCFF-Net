@@ -64,7 +64,49 @@ class EdgeAttention(nn.Module):
         return out
 
 ##----------------------------------------------------------------------------------------
+class DepthwiseSeparableConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+        super(DepthwiseSeparableConv, self).__init__()
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size,
+                                   stride=stride, padding=padding, groups=in_channels)
+        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+    def forward(self, x):
+        return self.pointwise(self.depthwise(x))
 
+##----------------------------------------------------------------------------------------
+class EMA_LightFreq(nn.Module):
+    def __init__(self, channels, c2=None, factor=32):
+        super(EMA_LightFreq, self).__init__()
+        self.groups = factor
+        assert channels // self.groups > 0
+        self.softmax = nn.Softmax(-1)
+        self.agp = nn.AdaptiveAvgPool2d((1, 1))
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        self.gn = nn.GroupNorm(channels // self.groups, channels // self.groups)
+        self.conv1x1 = nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=1, stride=1, padding=0)
+        self.conv_dw = DepthwiseSeparableConv(channels // self.groups, channels // self.groups)
+        self.freq_proj = nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=1)
+    def forward(self, x):
+        b, c, h, w = x.size()
+        group_x = x.reshape(b * self.groups, -1, h, w)  # b*g, c//g, h, w
+        x_h = self.pool_h(group_x)
+        x_w = self.pool_w(group_x).permute(0, 1, 3, 2)
+        hw = self.conv1x1(torch.cat([x_h, x_w], dim=2))
+        x_h, x_w = torch.split(hw, [h, w], dim=2)
+        x1 = self.gn(group_x * x_h.sigmoid() * x_w.permute(0, 1, 3, 2).sigmoid())
+        x2 = self.conv_dw(group_x)
+        freq = torch.fft.rfft2(group_x, norm="ortho")
+        freq_mag = torch.abs(freq)  # magnitude spectrum
+        freq_mag = torch.nn.functional.interpolate(freq_mag.unsqueeze(1).mean(-1), size=(h, w), mode="bilinear")
+        freq_feat = self.freq_proj(freq_mag.repeat(1, group_x.size(1), 1, 1))
+        x11 = self.softmax(self.agp(x1).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x12 = x2.reshape(b * self.groups, c // self.groups, -1)
+        x21 = self.softmax(self.agp(x2).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x22 = x1.reshape(b * self.groups, c // self.groups, -1)
+        weights = (torch.matmul(x11, x12) + torch.matmul(x21, x22)).reshape(b * self.groups, 1, h, w)
+        weights = weights + freq_feat
+        return (group_x * weights.sigmoid()).reshape(b, c, h, w)
 
 ##----------------------------------------------------------------------------------------
 class GlobalLocalFeature(nn.Module):
@@ -183,6 +225,11 @@ class ConvNeXt(nn.Module):
 
 
 class LayerNorm(nn.Module):
+    r""" LayerNorm that supports two data formats: channels_last (default) or channels_first.
+    The ordering of the dimensions in the inputs. channels_last corresponds to inputs with
+    shape (batch_size, height, width, channels) while channels_first corresponds to inputs
+    with shape (batch_size, channels, height, width).
+    """
 
     def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
         super().__init__()
@@ -203,7 +250,73 @@ class LayerNorm(nn.Module):
             x = (x - u) / torch.sqrt(s + self.eps)
             x = self.weight[:, None, None] * x + self.bias[:, None, None]
             return x
+#
+#
+model_urls = {
+    "convnext_small_1k": "https://dl.fbaipublicfiles.com/convnext/convnext_small_1k_224_ema.pth"
+}
 
 
 
-model = ConvNeXt(depths=[3,3,27,3], dims=[96,192,384,768])
+
+@register_model
+def convnext_small(pretrained=True, in_22k=False, **kwargs):
+    model = ConvNeXt(depths=[3, 3, 27, 3], dims=[96, 192, 384, 768], **kwargs)
+    if pretrained:
+        url = model_urls['convnext_small_22k'] if in_22k else model_urls['convnext_small_1k']
+        checkpoint = torch.hub.load_state_dict_from_url(url=url, map_location="cpu")
+        model.load_state_dict(checkpoint["model"])
+    return model
+
+model = ConvNeXt(depths=[3,3,27,3], dims=[96,192,384,768])   #### this is DRC-Net
+
+saved_model_path = 'D:\\TrainedModels\\CustomModel2\\Train_Val_CustomModel_07_Sep_ACID_.pt'
+model.load_state_dict(torch.load(saved_model_path),strict=False)
+model.head = nn.Linear(768, 10)
+model.to(device)
+print("✅ ConvNeXt backbone loaded, head initialized for 10 classes")
+print(model)
+
+densenet = models.densenet121(pretrained=True)
+densenet.classifier = nn.Linear(densenet.classifier.in_features, 10)
+densenet_ckpt = torch.load("D:\\TrainedModels\\DenseNet121\\Train_Val_result_14_Apr_ACID_denseNet-121_.pt", map_location="cuda")
+densenet.load_state_dict(densenet_ckpt, strict=False)
+print("✅ Loaded your trained DenseNet121 weights.")
+
+
+class SpatialConcatFusion(nn.Module):
+    def __init__(self, convnext, densenet, num_classes=10):
+        super(SpatialConcatFusion, self).__init__()
+        self.convnext = convnext
+        self.densenet = densenet
+
+        self.classifier = nn.Linear(768 + 1024, num_classes)
+
+    def extract_convnext_features(self, x):
+        # Run through ConvNeXt until last stage (no pooling)
+        for i in range(4):
+            x = self.convnext.downsample_layers[i](x)
+            x = self.convnext.stages[i](x)
+        return x  # (N, 768, 7, 7)
+
+    def forward(self, x):
+        # ---- ConvNeXt feature map ----
+        with torch.no_grad():
+            feat_convnext = self.extract_convnext_features(x)  # (N, 768, 7, 7)
+
+        # ---- DenseNet feature map ----
+        with torch.no_grad():
+            feat_densenet = self.densenet.features(x)
+            feat_densenet = F.relu(feat_densenet)  # (N, 1024, 7, 7)
+
+        fused = torch.cat((feat_convnext, feat_densenet), dim=1)  # (N, 1792, 7, 7)
+        fused = F.adaptive_avg_pool2d(fused, (1, 1)).view(fused.size(0), -1)  # (N, 1792)
+        out = self.classifier(fused)
+        return out
+
+finalModel=SpatialConcatFusion(model, densenet)
+
+saved_model_path = r"D:\TrainedModels\26 Feb HCFF_Net\weights_HCFF-Net.pt"
+finalModel.load_state_dict(torch.load(saved_model_path))
+finalModel.to(device)
+print(finalModel)
